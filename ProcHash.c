@@ -15,6 +15,10 @@ DWORD printErr(char *errInfo) {
 	return err;
 }
 
+char *getSha256Hash(char *filePath) {
+	
+}
+
 void procHandler(DWORD procID) {
 	// Attempt to grab process handle on each id in idProcList
 	HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, procID);
