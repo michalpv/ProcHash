@@ -1,5 +1,6 @@
 // Written by Michael Pavle
 #include <windows.h>
+#include <wincrypt.h>
 #include <psapi.h>
 #include <stdio.h>
 /*
@@ -11,12 +12,34 @@ GetProcessInformation - https://docs.microsoft.com/en-us/windows/win32/api/proce
 
 DWORD printErr(char *errInfo) {
 	DWORD err = GetLastError();
-	printf("[-] %s; Error %d\n", errInfo, err); // Print system error code supplied by GetLastError()
+	printf("[-] %s; Error %x\n", errInfo, err); // Print system error code supplied by GetLastError()
 	return err;
 }
 
-char *getSha256Hash(char *filePath) {
-	
+char *getSha256Hash(char *filePath) { // Will return a NULL pointer if failed
+	// MSDN Example: https://docs.microsoft.com/en-us/windows/win32/seccrypto/example-c-program--creating-an-md-5-hash-from-file-content
+	HCRYPTPROV hProv = 0;
+	HCRYPTHASH hHash = 0;
+	// Get cryptographic service provider (CSP) context
+	//if(!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) { // PROV_RSA_FULL DOES NOT support MD5 and SHA-2 hashing
+	//^ Error code 0x80090008 - https://stackoverflow.com/questions/25822745/using-sha2-512-calg-sha-512-on-windows-7-returns-invalid-algorithm-specified
+	if(!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) { // PROV_RSA_AES supports MD5 and SHA-2 hashing
+		//^ https://docs.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-cryptacquirecontexta
+		printErr("Couldn't create cryptographic context");
+		return NULL;
+	}
+	HCRYPTKEY hKey = 0; // Avoid differing type warnings for CryptCreateHash (don't just pass 0)
+	if (!CryptCreateHash(hProv, CALG_SHA_256, hKey, 0, &hHash)) { // SHA-256 > MD5
+		CryptReleaseContext(hProv, 0);
+		printErr("Couldn't create CSP hash object");
+		return NULL;
+	}
+	// Get file handle and read content
+	HANDLE hFile = CreateFile(filePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL); // https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
+	if (hFile == INVALID_HANDLE_VALUE) {
+		printErr("Failed to open file handle");
+		return NULL;
+	}
 }
 
 void procHandler(DWORD procID) {
@@ -31,7 +54,7 @@ void procHandler(DWORD procID) {
 			printErr("Failed to get file path");
 		}
 		printf("[+] Process ID %d executable located at: %s\n", procID, filePath);
-		getSha256Hash(filePath);
+		getSha256Hash(filePath); // Test
 	}
 	CloseHandle(hProc);
 }
@@ -43,7 +66,7 @@ int main() {
 	if (!EnumProcesses(idProcList, sizeof(idProcList), &cbNeeded)) {
 		return printErr("Failed to enumerate processes");
 	}
-	// Check that cbNeeded is equal to the size of idProcList; if so, make new buffer using malloc of size cbNeeded + 10? (To ensure that no process is overlooked)
+	// Check that cbNeeded is equal to the size of idProcList; if so, recall EnumProcesses with larger array size
 	for (int i = 0; i < (cbNeeded / sizeof(DWORD)); i++) { // cbNeeded will never exceed the size of idProcList, no bounds checking is required (EnumProcesses is safe)
 		procHandler(idProcList[i]);
 	}
