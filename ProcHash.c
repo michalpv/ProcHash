@@ -14,13 +14,34 @@ Hashing w/ CryptAPI - https://docs.microsoft.com/en-us/windows/win32/seccrypto/e
 #define BUFSIZE 1024
 #define SHA2LEN 32
 
+struct fileInfo {
+char filePath[MAX_PATH+1];
+char hash[SHA2LEN*2+1]; // *2 because of string representation, +1 for null term
+DWORD procID;
+};
+
+DWORD printErr(char *errInfo);
+DWORD getSha256Hash(char *filePath, char *fileHash);
+BOOL procHandler(DWORD procID, struct fileInfo *currentProc);
+void byteToHash(BYTE *hash, DWORD hashLen, char *charHash);
+
 DWORD printErr(char *errInfo) {
 	DWORD err = GetLastError();
 	printf("[-] %s; Error %x\n", errInfo, err); // Print system error code supplied by GetLastError()
 	return err;
 }
 
-DWORD getSha256Hash(char *filePath, BYTE *fileHash) { // Will return 0 if failed, function returns size of file hash (In the case that I change the hashing algorithm), fileHash stores hash
+void byteToHash(BYTE *hash, DWORD hashLen, char *charHash) { // No need to return anything (hashLen is BYTE array length)
+	CHAR rgbDigits[] = "0123456789abcdef";
+
+	for (int i = 0; i < hashLen; i++) { // charHash length MUST be equivalent to SHA2LEN*2+1
+		charHash[i*2] = rgbDigits[hash[i] >> 4];
+		charHash[i*2+1] = rgbDigits[hash[i] & 0xf];
+	}
+	charHash[hashLen*2] = 0x0;
+}
+
+DWORD getSha256Hash(char *filePath, char *fileHash) { // Will return 0 if failed, function returns size of file hash (In the case that I change the hashing algorithm), fileHash stores hash
 	// MSDN Example: https://docs.microsoft.com/en-us/windows/win32/seccrypto/example-c-program--creating-an-md-5-hash-from-file-content
 	HCRYPTPROV hProv = 0;
 	HCRYPTHASH hHash = 0;
@@ -75,62 +96,74 @@ DWORD getSha256Hash(char *filePath, BYTE *fileHash) { // Will return 0 if failed
 	}
 
 	DWORD hashLen = SHA2LEN;
-	
-	if (!CryptGetHashParam(hHash, HP_HASHVAL, fileHash, &hashLen, 0)) {
+	char fileHashBytes[SHA2LEN];
+
+	if (!CryptGetHashParam(hHash, HP_HASHVAL, fileHashBytes, &hashLen, 0)) {
 		printErr("CryptGetHashParam failed");
 	}
-	
-	// Print SHA-256 hash
-	CHAR rgbDigits[] = "0123456789abcdef";
-	printf("[+] SHA-256 hash of file %s is: ", filePath);
-	for (DWORD i = 0; i < hashLen; i++)
-	{
-		printf("%c%c", rgbDigits[fileHash[i] >> 4], rgbDigits[fileHash[i] & 0xf]);
-	}
-	printf("\n");
 		
 	CryptReleaseContext(hProv, 0);
 	CryptDestroyHash(hHash);
 	
-	return hashLen;
+	// Now, convert BYTE array fileHash to char[]
+	byteToHash(fileHashBytes, hashLen, fileHash);
+
+	return hashLen; // Hash length in bytes (not char array length)
 }
 
-void procHandler(DWORD procID) {
+//DWORD WINAPI procHandler(void* arg) { // ThreadProc() - CreateThread reference
+	//DWORD procID = (DWORD) arg;
+BOOL procHandler(DWORD procID, struct fileInfo *currentProc) {
 	// Attempt to grab process handle on each id in idProcList
 	HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, procID);
-	if (hProc != NULL) {
-		// Get process information and location of the executable
-		// GetModuleFileNameEx - Grabs file path of executable process - https://docs.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-getmodulefilenameexa
-		char filePath[256];
-		if (GetModuleFileNameEx(hProc, 0, filePath, sizeof(filePath)) == 0) {
-			printErr("Failed to get file path");
-		}
-		printf("[+] Process ID %d executable located at: %s\n", procID, filePath);
-		
-		BYTE fileHash[SHA2LEN]; // Hash length of SHA256 (32 byte array)
-		DWORD hashLen = getSha256Hash(filePath, fileHash); // Get SHA256 hash as BYTE array
-		if (hashLen == 0) {
-			printf("[-] Sha256Hash failed\n");
-			return;
-		}
-
-		// To Do:
-
-
+	if (hProc == NULL) {
+		return FALSE;
 	}
+	// Get process information and location of the executable
+	// GetModuleFileNameEx - Grabs file path of executable process - https://docs.microsoft.com/en-us/windows/win32/api/psapi/nf-psapi-getmodulefilenameexa
+	char filePath[MAX_PATH+1];
+	if (GetModuleFileNameEx(hProc, 0, filePath, sizeof(filePath)) == 0) {
+		printErr("Failed to get file path");
+		return FALSE;
+	}
+	printf("[+] Process ID %d executable located at: %s\n", procID, filePath);
+	
+	char fileHash[SHA2LEN*2+1]; // Hash length of SHA256*2 for string length +1 for null terminator
+	DWORD hashLen = getSha256Hash(filePath, fileHash); // Get SHA256 hash as CHAR array
+	if (hashLen == 0) {
+		printf("[-] Sha256Hash failed\n");
+		return FALSE;
+	}
+	printf("[+] File Sha256 hash: %s\n", fileHash);
+
+	strncpy(currentProc->filePath, filePath, sizeof(currentProc->filePath) - 1);
+	currentProc->filePath[MAX_PATH] = 0x0;// Add null terminator manually
+
+	strncpy(currentProc->hash, fileHash, sizeof(currentProc->hash)); // 64 bytes are expected
+	currentProc->procID = procID;
+	
+	return TRUE;
 	CloseHandle(hProc);
 }
 
 int main() {
-	DWORD idProcList[1024]; // Expand buffer if necessary (Not easy to predict needed size)
+	DWORD idProcList[1000]; // Expand buffer if necessary (Not easy to predict needed size)
 	DWORD cbNeeded;
+
+	struct fileInfo fileInfoList[1000];
+
 	// Populate idProcList and verify no error occurred
 	if (!EnumProcesses(idProcList, sizeof(idProcList), &cbNeeded)) {
 		return printErr("Failed to enumerate processes");
 	}
-	// Check that cbNeeded is equal to the size of idProcList; if so, recall EnumProcesses with larger array size
+	// TODO: Check that cbNeeded is equal to the size of idProcList; if so, recall EnumProcesses with larger array size
+	
 	for (int i = 0; i < (cbNeeded / sizeof(DWORD)); i++) { // cbNeeded will never exceed the size of idProcList, no bounds checking is required (EnumProcesses is safe)
-		procHandler(idProcList[i]);
+		struct fileInfo currentProc;
+		if (procHandler(idProcList[i], &currentProc)) {
+			printf("fileInfo struct - Path: %s\nHash: %s\nProcID: %d\n", currentProc.filePath, currentProc.hash, currentProc.procID); // For debugging
+		}
+		//CreateThread(NULL, 0, procHandler, (LPVOID) idProcList[i], 0, NULL);
 	}
 	getch();
 	return 0;
