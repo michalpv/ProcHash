@@ -24,8 +24,9 @@ char hash[SHA2LEN*2+1]; // *2 because of string representation, +1 for null term
 DWORD procID;
 };
 
+// Function signatures
 DWORD printErr(char *errInfo);
-DWORD getSha256Hash(char *filePath, char *fileHash);
+int getSha256Hash(char *filePath, char *fileHash);
 BOOL procHandler(DWORD procID, struct fileInfo *currentProc);
 void byteToHash(BYTE *hash, DWORD hashLen, char *charHash);
 
@@ -35,7 +36,7 @@ DWORD printErr(char *errInfo) {
 	return err;
 }
 
-void byteToHash(BYTE *hash, DWORD hashLen, char *charHash) { // No need to return anything (hashLen is BYTE array length)
+void byteToHash(BYTE *hash, DWORD hashLen, char *charHash) { // No need to return anything; hashLen is BYTE array length
 	CHAR rgbDigits[] = "0123456789abcdef";
 
 	for (int i = 0; i < hashLen; i++) { // charHash length MUST be equivalent to SHA2LEN*2+1
@@ -45,7 +46,7 @@ void byteToHash(BYTE *hash, DWORD hashLen, char *charHash) { // No need to retur
 	charHash[hashLen*2] = 0x0;
 }
 
-DWORD getSha256Hash(char *filePath, char *fileHash) { // Will return 0 if failed, function returns size of file hash (In the case that I change the hashing algorithm), fileHash stores hash
+int getSha256Hash(char *filePath, char *fileHash) { // Will return 0 if failed, function returns size of file hash (In the case that I change the hashing algorithm), fileHash stores hash
 	// MSDN Example: https://docs.microsoft.com/en-us/windows/win32/seccrypto/example-c-program--creating-an-md-5-hash-from-file-content
 	HCRYPTPROV hProv = 0;
 	HCRYPTHASH hHash = 0;
@@ -61,8 +62,10 @@ DWORD getSha256Hash(char *filePath, char *fileHash) { // Will return 0 if failed
 		return 0;
 	}
 	// Get file handle and read content
+	PVOID OldValue = NULL;
+	Wow64DisableWow64FsRedirection(&OldValue); // Credz to: https://stackoverflow.com/questions/885742/createfile-error-in-windows7
 	HANDLE hFile = CreateFile(filePath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL); // https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
-	// ^ Opening files in C:\Windows\System32 directory throws system error code ERROR_FILE_NOT_FOUND (0x2)
+	
 	if (hFile == INVALID_HANDLE_VALUE) {
 		printErr("Failed to open file handle");
 		CryptReleaseContext(hProv, 0);
@@ -134,7 +137,7 @@ BOOL procHandler(DWORD procID, struct fileInfo *currentProc) {
 	printf("[+] Process ID %d executable located at: %s\n", procID, filePath);
 	
 	char fileHash[SHA2LEN*2+1]; // Hash length of SHA256*2 for string length +1 for null terminator
-	DWORD hashLen = getSha256Hash(filePath, fileHash); // Get SHA256 hash as CHAR array
+	int hashLen = getSha256Hash(filePath, fileHash); // Get SHA256 hash as CHAR array
 	if (hashLen == 0) {
 		printf("[-] Sha256Hash failed\n");
 		return FALSE;
