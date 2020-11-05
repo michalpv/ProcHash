@@ -9,18 +9,24 @@ Hashing w/ CryptAPI - https://docs.microsoft.com/en-us/windows/win32/seccrypto/e
 
 #include <windows.h>
 #include <wincrypt.h>
+#include <winhttp.h>
 #include <psapi.h>
 #include <stdio.h>
+//#include "jsmn.h" // Open source JSON parser in C: https://zserge.com/jsmn/
 
 #pragma comment(lib, "Advapi32.lib")
 #pragma comment(lib, "Psapi.lib")
+#pragma comment(lib, "Winhttp.lib")
 
 #define BUFSIZE 1024
 #define SHA2LEN 32
+#define MAXPROC 1000
+#define APIKEY "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" // API key for MetaDefender Cloud; MUST BE CHANGED for program to work
 
 struct fileInfo {
 char filePath[MAX_PATH+1];
 char hash[SHA2LEN*2+1]; // *2 because of string representation, +1 for null term
+int detections;
 DWORD procID;
 };
 
@@ -29,6 +35,7 @@ DWORD printErr(char *errInfo);
 int getSha256Hash(char *filePath, char *fileHash);
 BOOL procHandler(DWORD procID, struct fileInfo *currentProc);
 void byteToHash(BYTE *hash, DWORD hashLen, char *charHash);
+BOOL hashLookup(struct fileInfo *fileInfoList, int listLen);
 
 DWORD printErr(char *errInfo) {
 	DWORD err = GetLastError();
@@ -37,9 +44,9 @@ DWORD printErr(char *errInfo) {
 }
 
 void byteToHash(BYTE *hash, DWORD hashLen, char *charHash) { // No need to return anything; hashLen is BYTE array length
-	CHAR rgbDigits[] = "0123456789abcdef";
+	CHAR rgbDigits[] = "0123456789ABCDEF";
 
-	for (int i = 0; i < hashLen; i++) { // charHash length MUST be equivalent to SHA2LEN*2+1
+	for (int i = 0; i < hashLen; i++) { // charHash length MUST be equivalent to hashLen*2+1
 		charHash[i*2] = rgbDigits[hash[i] >> 4];
 		charHash[i*2+1] = rgbDigits[hash[i] & 0xf];
 	}
@@ -99,7 +106,6 @@ int getSha256Hash(char *filePath, char *fileHash) { // Will return 0 if failed, 
 		printErr("ReadFile failed");
 		CryptReleaseContext(hProv, 0);
 		CryptDestroyHash(hHash);
-		//CloseHandle(hFile);
 		return 0;
 	}
 
@@ -119,8 +125,6 @@ int getSha256Hash(char *filePath, char *fileHash) { // Will return 0 if failed, 
 	return hashLen; // Hash length in bytes (not char array length)
 }
 
-//DWORD WINAPI procHandler(void* arg) { // ThreadProc() - CreateThread reference
-	//DWORD procID = (DWORD) arg;
 BOOL procHandler(DWORD procID, struct fileInfo *currentProc) {
 	// Attempt to grab process handle on each id in idProcList
 	HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, procID);
@@ -150,15 +154,146 @@ BOOL procHandler(DWORD procID, struct fileInfo *currentProc) {
 	strncpy(currentProc->hash, fileHash, sizeof(currentProc->hash)); // 64 bytes are expected
 	currentProc->procID = procID;
 	
-	return TRUE;
 	CloseHandle(hProc);
+	return TRUE;
+}
+
+BOOL hashLookup(struct fileInfo *fileInfoList, int listLen) {
+	/*
+		Sample request data:
+		{
+    		"hash": ["8F7920DA1D52B06A61D7A41C51D595AC", "AA73B43084E93E741552E5B9C8DEE457", "3433B43084EABC741552E52AD8DEE457"]
+		}
+		character count = (SHA2LEN * 2 + 3) * MAXPROC + 10 + 1
+	*/
+
+	char hashJson[(SHA2LEN*2+3)*MAXPROC+10+1]; // + 1 for null term
+	char *charTarget = hashJson;
+
+	// Enumerate each entry in fileInfoList array and add hashes to JSON request
+	charTarget += sprintf(hashJson, "{\"hash\":[");
+
+	for (int i = 0; i < listLen; i++) {
+		if (i != listLen-1) { // If not the final record
+			charTarget += sprintf(charTarget, "\"%s\",", fileInfoList[i].hash);
+		}
+		else {
+			sprintf(charTarget, "\"%s\"", fileInfoList[i].hash);
+		}
+	}
+	strcat(hashJson, "]}");
+
+	printf("%s", hashJson);
+
+	HINTERNET hSession = WinHttpOpen(
+		L"ProcHash v1.0",
+		WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, // Uses deafult IE proxy settings
+		WINHTTP_NO_PROXY_NAME,
+		WINHTTP_NO_PROXY_BYPASS,
+		0
+	);
+	if (!hSession) {return FALSE;}
+
+	HINTERNET hConnect = WinHttpConnect(
+		hSession,
+		L"api.metadefender.com", // Hostame of endpoint
+		//L"google.com", // Hostame of endpoint
+		INTERNET_DEFAULT_HTTPS_PORT,
+		0
+	);
+	if (!hConnect) {return FALSE;}
+
+	HINTERNET hRequest = WinHttpOpenRequest(
+		hConnect,
+		L"POST",
+		L"v4/hash", // Object name
+		NULL,
+		WINHTTP_NO_REFERER,
+		WINHTTP_DEFAULT_ACCEPT_TYPES,
+		WINHTTP_FLAG_SECURE
+	);
+	if (!hRequest) {return FALSE;}
+
+	DWORD dataLen = strlen(hashJson); // USE strlen NOT sizeof; otherwise, request will send gibberish from unused space in hashJson array
+	BOOL bResults = WinHttpSendRequest(
+		hRequest,
+		L"apikey: " APIKEY, // API key for MetaDefender Cloud
+		0,
+		hashJson,
+		dataLen,
+		dataLen, // Content length of post data (JSON request)
+		0
+	);
+	if (!bResults) {return FALSE;}
+
+	bResults = WinHttpReceiveResponse(
+		hRequest,
+		NULL
+	);
+	if (!bResults) {return FALSE;}
+
+	// Read available data repetitively into char array
+	int totalSize = 1; // Start at 1 to allow space for null terminator
+	char *responseData = (char *) calloc(totalSize, 1); // Allocate 1-byte block of memory; write 0x0; sizeof(char) = 1;
+	if (responseData == NULL) {
+		return FALSE;
+	}
+	char *outBuffer;
+	DWORD dwSize;
+	do {
+		dwSize = 0;
+		WinHttpQueryDataAvailable(
+			hRequest,
+			&dwSize
+		);
+		if (dwSize == 0) {
+			break;
+		}
+		// MSDN uses ZeroMemory Win32 function; calloc achieves same thing while also allocating heap block
+		outBuffer = (char *) calloc(dwSize+1, 1); // sizeof(char) = 1 byte
+
+		if (outBuffer == NULL) { // If memory couldn't be allocated
+			dwSize = 0;
+		}
+		else {
+			if (!WinHttpReadData(
+				hRequest,
+				(LPVOID) outBuffer,
+				dwSize,
+				NULL
+			)) {
+				dwSize = 0; // Failed to read data
+			}
+			else {
+				//printf("%s", outBuffer); // Output buffer chunk by chunk
+				totalSize += dwSize;
+				responseData = (char *) realloc(responseData, totalSize);
+				if (responseData == NULL) { // realloc call failed, not enough memory
+					dwSize = 0;
+				}
+				else {
+					strcat(responseData, outBuffer);
+					free(outBuffer);
+				}
+			}
+		}
+	} while (dwSize > 0);
+
+	printf("\n------------------------\nResponse Data: %s\n---------\ntotalSize int: %d", responseData, totalSize);
+	free(responseData);
+	
+	// Close all handles that have been created
+	WinHttpCloseHandle(hSession);
+	WinHttpCloseHandle(hConnect);
+	WinHttpCloseHandle(hRequest);
+	return TRUE;
 }
 
 int main() {
-	DWORD idProcList[1000]; // Expand buffer if necessary (Not easy to predict needed size)
+	DWORD idProcList[MAXPROC]; // Expand buffer if necessary (Not easy to predict needed size)
 	DWORD cbNeeded;
 
-	struct fileInfo fileInfoList[1000]; // Same size as idProcList
+	struct fileInfo fileInfoList[MAXPROC]; // Same size as idProcList
 
 	// Populate idProcList and verify no error occurred
 	if (!EnumProcesses(idProcList, sizeof(idProcList), &cbNeeded)) {
@@ -169,7 +304,7 @@ int main() {
 	for (int i = 0; i < (cbNeeded / sizeof(DWORD)); i++) { // cbNeeded will never exceed the size of idProcList, no bounds checking is required (EnumProcesses is safe)
 		struct fileInfo currentProc;
 		if (procHandler(idProcList[i], &currentProc)) {
-			printf("fileInfo struct;\n\tPath: %s\n\tHash: %s\n\tProcID: %d\n", currentProc.filePath, currentProc.hash, currentProc.procID); // For debugging
+			printf("fileInfo struct:\n\tPath: %s\n\tHash: %s\n\tProcID: %d\n", currentProc.filePath, currentProc.hash, currentProc.procID); // For debugging
 			// Enumerate each item in fileInfoList to make sure no duplicate hash exists
 			BOOL dupeExists = FALSE;
 			for (int index = 0; index < topIndex; index++) {
@@ -183,13 +318,16 @@ int main() {
 				topIndex++;
 			}
 		}
-		//CreateThread(NULL, 0, procHandler, (LPVOID) idProcList[i], 0, NULL);
 	}
 
 	// Enumerate each fileInfo struct in fileInfoList
 	printf("Filtered list:\n----------------------------\n");
 	for (int i = 0; i < topIndex; i++) {
 		printf("File path: %s\nHash: %s\nProcID: %d\n----------------------------\n", fileInfoList[i].filePath, fileInfoList[i].hash, fileInfoList[i].procID);
+	}
+
+	if (!hashLookup(fileInfoList, topIndex)) { // topIndex is equivalent to length of the fileInfoList array
+		printErr("hashLookup failed");
 	}
 	getch();
 	return 0;
